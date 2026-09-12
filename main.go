@@ -185,18 +185,10 @@ func rewritePlainHTTPRequest(header []byte) (string, int, []byte, error) {
 }
 
 func openDragonTCPTunnel(serverAddr, token, targetHost string, targetPort int, transport string, tcpBuffer int) (net.Conn, error) {
-	d := net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	conn, err := d.Dial("tcp", serverAddr)
+	conn, err := protocol.DialTCP("tcp", serverAddr, 10*time.Second, tcpBuffer)
 	if err != nil {
 		return nil, err
 	}
-
-	protocol.TuneTCP(conn)
-	protocol.TuneTCPBuffer(conn, tcpBuffer)
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	// Correlation only; cryptographic randomness is unnecessary here.
@@ -357,18 +349,60 @@ func handleLocal(conn net.Conn, serverAddr, token, transport string, tcpBuffer i
 	}
 }
 
-const serverPortReachabilityTimeout = 900 * time.Millisecond
-
-func serverPortReachable(host string, port int, tcpBuffer int) bool {
-	d := net.Dialer{Timeout: serverPortReachabilityTimeout, KeepAlive: 30 * time.Second}
-	conn, err := d.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+func serverPortReachableErr(host string, port int, tcpBuffer int, timeout time.Duration) (bool, error) {
+	conn, err := protocol.DialTCP("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout, tcpBuffer)
 	if err != nil {
-		return false
+		return false, err
 	}
-	protocol.TuneTCP(conn)
-	protocol.TuneTCPBuffer(conn, tcpBuffer)
 	_ = conn.Close()
-	return true
+	return true, nil
+}
+
+func parseTargetHosts(input string) []string {
+	parts := strings.Split(input, ",")
+	var hosts []string
+	seen := make(map[string]bool)
+	for _, p := range parts {
+		h := strings.TrimSpace(p)
+		if h == "" {
+			continue
+		}
+		if ip := net.ParseIP(h); ip != nil {
+			ipStr := ip.String()
+			if !seen[ipStr] {
+				hosts = append(hosts, ipStr)
+				seen[ipStr] = true
+			}
+			continue
+		}
+		ips, err := net.LookupIP(h)
+		if err == nil && len(ips) > 0 {
+			var v6, v4 []string
+			for _, ip := range ips {
+				ipStr := ip.String()
+				if ip.To4() == nil {
+					v6 = append(v6, ipStr)
+				} else {
+					v4 = append(v4, ipStr)
+				}
+			}
+			for _, item := range append(v6, v4...) {
+				if !seen[item] {
+					hosts = append(hosts, item)
+					seen[item] = true
+				}
+			}
+		} else {
+			if !seen[h] {
+				hosts = append(hosts, h)
+				seen[h] = true
+			}
+		}
+	}
+	if len(hosts) == 0 {
+		return []string{input}
+	}
+	return hosts
 }
 
 // selectServerEndpoint walks the user-configured port range in ascending order.
@@ -377,7 +411,7 @@ func serverPortReachable(host string, port int, tcpBuffer int) bool {
 // Only one port candidate is protocol-tested at a time; UP/DW calibration starts
 // only after a single endpoint has been locked.
 func selectServerEndpoint(
-	host string,
+	hostInput string,
 	portStart int,
 	portEnd int,
 	token string,
@@ -389,31 +423,55 @@ func selectServerEndpoint(
 	forceClear bool,
 	tcpBuffer int,
 ) (*wireSelector, string, int, error) {
-	total := portEnd - portStart + 1
-	fmt.Printf("[D-TCP] phase=PORT_SCAN state=starting host=%s start=%d end=%d total=%d protocol_validation=true\n", host, portStart, portEnd, total)
+	hosts := parseTargetHosts(hostInput)
+	numPorts := portEnd - portStart + 1
+	totalCandidates := numPorts * len(hosts)
 
+	reachabilityTimeout := 400 * time.Millisecond
+	if totalCandidates <= 2 {
+		reachabilityTimeout = 4 * time.Second
+	} else if totalCandidates <= 16 {
+		reachabilityTimeout = 1200 * time.Millisecond
+	}
+
+	fmt.Printf("[D-TCP] phase=PORT_SCAN state=starting hosts=%v start=%d end=%d ports=%d carrier=tcp total_candidates=%d protocol_validation=true fallback_order=port_then_host\n", hosts, portStart, portEnd, numPorts, totalCandidates)
+
+	candidateIndex := 0
 	for port := portStart; port <= portEnd; port++ {
-		index := port - portStart + 1
-		// Keep logs readable for wide ranges: always show the first candidate,
-		// every 16th candidate, and every TCP-reachable candidate.
-		if index == 1 || index%16 == 0 || port == portEnd {
-			fmt.Printf("[D-TCP] phase=PORT_SCAN state=testing candidate=%d progress=%d/%d\n", port, index, total)
-		}
-		if !serverPortReachable(host, port, tcpBuffer) {
-			continue
-		}
+		for _, host := range hosts {
+			candidateIndex++
+			family := "ipv4"
+			if strings.Contains(host, ":") {
+				family = "ipv6"
+			}
 
-		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		fmt.Printf("[D-TCP] phase=PORT_SCAN state=tcp_reachable candidate=%d progress=%d/%d\n", port, index, total)
-		selector := newWireSelector(configuredWire, addr, token, binOpts, xorOpts, probeDelay, probeThreads, forceClear)
-		choice, err := selector.resolveOnly()
-		if err != nil {
-			fmt.Printf("[D-TCP] phase=PORT_SCAN state=rejected candidate=%d reason=no_validated_wire\n", port)
-			continue
-		}
+			if candidateIndex == 1 || candidateIndex%16 == 0 || candidateIndex == totalCandidates {
+				fmt.Printf("[D-TCP] phase=PORT_SCAN state=testing candidate=%d host=%s family=%s progress=%d/%d\n", port, host, family, candidateIndex, totalCandidates)
+			}
 
-		fmt.Printf("[D-TCP] phase=PORT_SCAN state=success port=%d wire=%s header_mask=%02x clear_payload=%t\n", port, choice.mode, choice.mask, choice.cover.Clear)
-		return selector, addr, port, nil
+			reachable, err := serverPortReachableErr(host, port, tcpBuffer, reachabilityTimeout)
+			if !reachable {
+				if totalCandidates <= 4 {
+					fmt.Printf("[D-TCP] phase=PORT_SCAN state=unreachable candidate=%d host=%s family=%s error=%v\n", port, host, family, err)
+				}
+				continue
+			}
+
+			addr := net.JoinHostPort(host, strconv.Itoa(port))
+			fmt.Printf("[D-TCP] phase=PORT_SCAN state=tcp_reachable candidate=%d host=%s family=%s progress=%d/%d\n", port, host, family, candidateIndex, totalCandidates)
+			selector := newWireSelector(configuredWire, addr, token, binOpts, xorOpts, probeDelay, probeThreads, forceClear)
+			choice, err := selector.resolveOnly()
+			if err != nil {
+				fmt.Printf("[D-TCP] phase=PORT_SCAN state=rejected candidate=%d host=%s family=%s reason=no_validated_wire\n", port, host, family)
+				continue
+			}
+
+			if family == "ipv4" {
+				fmt.Printf("Selected IPV4 endpoint %s; IPv4 may be the L2TP proxy path\n", host)
+			}
+			fmt.Printf("[D-TCP] phase=PORT_SCAN state=success port=%d host=%s family=%s wire=%s header_mask=%02x clear_payload=%t\n", port, host, family, choice.mode, choice.mask, choice.cover.Clear)
+			return selector, addr, port, nil
+		}
 	}
 
 	fmt.Printf("[D-TCP] phase=PORT_SCAN state=failed start=%d end=%d reason=no_working_dragontcp_port\n", portStart, portEnd)
@@ -452,6 +510,10 @@ func main() {
 		forceClearPayload   = flag.Bool("force-clear-payload", false, "force B/BP clear payloads and disable the SHA-256 payload mask; no masked fallback")
 		wireProbeDelay      = flag.Duration("wire-probe-delay", 100*time.Millisecond, "minimum delay between header/profile probe starts (50ms-30s)")
 		wireProbeThreads    = flag.Int("wire-probe-threads", 1, "maximum concurrent wire profile probes (1-16)")
+		protocolVersion     = flag.String("protocol-version", "v1", "DragonTCP protocol version: v1 (legacy 29/5 bytes) or v2 (multiplexed 33/9 bytes)")
+		httpPayload         = flag.String("http-payload", "", "custom HTTP payload template injected before binary framing (supports [crlf], [host], [port], [ua], etc.)")
+		iperfDuration       = flag.Duration("iperf-duration", 0, "fake-iperf sustained test duration (e.g. 5s, 15s; 0 disables)")
+		iperfTargetMbps     = flag.Float64("iperf-target-mbps", 1.0, "fake-iperf sustained target aggregate throughput in Mbps")
 
 		sshUser         = flag.String("ssh-user", "", "SSH tunnel username; enables tunnel-only SSH/SOCKS mode")
 		sshPassword     = flag.String("ssh-password", "", "SSH tunnel password")
@@ -465,6 +527,7 @@ func main() {
 		sshUDPGWPort    = flag.Int("ssh-udpgw-port", 7400, "UDPGW port as seen by the SSH server")
 	)
 	flag.Parse()
+	protocol.SetGlobalPayload(*httpPayload)
 	if strings.TrimSpace(*sshPasswordEnv) != "" {
 		*sshPassword = os.Getenv(strings.TrimSpace(*sshPasswordEnv))
 	}
@@ -580,6 +643,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--wire-probe-threads must be between 1 and 16")
 		os.Exit(2)
 	}
+	*protocolVersion = strings.ToLower(strings.TrimSpace(*protocolVersion))
+	if *protocolVersion != "v1" && *protocolVersion != "v2" {
+		fmt.Fprintln(os.Stderr, "--protocol-version must be v1 or v2")
+		os.Exit(2)
+	}
+	fmt.Printf("[D-TCP] protocol_version=%s\n", *protocolVersion)
 	sshEnabled := strings.TrimSpace(*sshUser) != ""
 	var err error
 	if sshEnabled {
@@ -609,12 +678,17 @@ func main() {
 		txnTimeout:     *chunkTimeout,
 		tcpBuffer:      *tcpBuffer,
 		forceMaxStart:  *chunkMaxFirst,
+		iperfDuration:  *iperfDuration,
+		iperfTargetMbps: *iperfTargetMbps,
 	}
 
 	xorOpts := xorchunk.NewOptions(
 		*chunkStart, *chunkMin, *chunkMax, *chunkAdaptive, *chunkSuccesses, *chunkShrinkAfter, *chunkAdaptLog,
 		*chunkPollers, *chunkReconnect, *chunkPollDelay, *chunkTimeout, *tcpBuffer,
 	)
+	if *iperfDuration > 0 {
+		xorOpts = xorOpts.WithIperf(*iperfDuration, *iperfTargetMbps)
+	}
 
 	listenAddr := net.JoinHostPort(*listenHost, strconv.Itoa(*listenPort))
 
@@ -649,6 +723,9 @@ func main() {
 	} else {
 		fmt.Printf("wire=%s discovering fixed header profile full_range=00-ff protocol_probe=server-local probe_delay=%s probe_threads=%d force_clear_payload=false\n", *wireMode, wireProbeDelay.String(), *wireProbeThreads)
 	}
+	if *httpPayload != "" {
+		fmt.Printf("http_payload=custom length=%d\n", len(*httpPayload))
+	}
 
 	// Port discovery happens before chunk calibration. A TCP-open port must also
 	// pass the DragonTCP wire/header probe before it becomes the WORKING PORT.
@@ -673,7 +750,7 @@ func main() {
 	var sshManager *sshTunnelManager
 	var socksListener net.Listener
 	if strings.TrimSpace(*sshUser) != "" {
-		sshManager, err = newSSHTunnelManager(wires, *sshUser, *sshPassword, *sshInternalHost, *sshInternalPort, *sshHostKeyPin, *sshUDPGWHost, *sshUDPGWPort)
+		sshManager, err = newSSHTunnelManager(wires, *sshUser, *sshPassword, *sshInternalHost, *sshInternalPort, *sshHostKeyPin, *sshUDPGWHost, *sshUDPGWPort, *tcpBuffer)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -693,7 +770,7 @@ func main() {
 			os.Exit(1)
 		}
 		defer socksListener.Close()
-		fmt.Printf("ssh_mode=true local_socks5=%s internal_ssh=%s:%d udpgw=%s:%d user=%s\n", socksAddr, *sshInternalHost, *sshInternalPort, *sshUDPGWHost, *sshUDPGWPort, *sshUser)
+		fmt.Printf("ssh_mode=true local_socks5=%s internal_ssh=%s:%d udpgw=%s:%d user=%s tcp_buffer=%d\n", socksAddr, *sshInternalHost, *sshInternalPort, *sshUDPGWHost, *sshUDPGWPort, *sshUser, *tcpBuffer)
 	}
 
 	ln, err := net.Listen("tcp", listenAddr)

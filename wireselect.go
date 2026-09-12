@@ -178,12 +178,18 @@ func (s *wireSelector) prepare() (wireChoice, error) {
 		}
 		fmt.Printf("[D-TCP] phase=CALIBRATION state=starting wire=x strategy=ascending min=%d max=%d growth=4x fine_resolution=%d up_down=sequential\n", xopts.MinSize(), xopts.MaxSize(), calibrationFineResolution)
 		up, down, persistent := xorchunk.Calibrate(s.serverAddr, s.token, xopts, calibrationFineResolution)
+		safeChunk := minInt(up, down)
+		workers := xorchunk.CalculateParallelWorkers(safeChunk)
+		if workers > xopts.Pollers() {
+			xopts = xopts.WithPollers(workers)
+		}
 		xopts = xopts.WithCalibratedChunks(up, down)
 		s.mu.Lock()
 		s.xorOpts = xopts
 		s.mu.Unlock()
-		fmt.Printf("[D-TCP] phase=CALIBRATION state=success wire=x upload=%d download=%d persistent=%t lock_runtime_chunks=true\n", up, down, persistent)
-		fmt.Printf("[D-TCP] phase=ACTIVE wire=%s header_mask=%02x clear_payload=%t upload_chunk=%d download_chunk=%d calibrated_locked=true runtime_adaptive=false\n", choice.mode, choice.mask, choice.cover.Clear, up, down)
+		fmt.Printf("[D-TCP] phase=WORKERS chunk=%d safe_kb=%d workers=%d target_aggregate_kb=1024 rule=auto_scale\n", safeChunk, safeChunk/1024, workers)
+		fmt.Printf("[D-TCP] phase=CALIBRATION state=success wire=x upload=%d download=%d pollers=%d persistent=%t lock_runtime_chunks=true\n", up, down, workers, persistent)
+		fmt.Printf("[D-TCP] phase=ACTIVE wire=%s header_mask=%02x clear_payload=%t upload_chunk=%d download_chunk=%d pollers=%d calibrated_locked=true runtime_adaptive=false\n", choice.mode, choice.mask, choice.cover.Clear, up, down, workers)
 		return choice, nil
 	}
 
@@ -199,8 +205,10 @@ func (s *wireSelector) prepare() (wireChoice, error) {
 		fmt.Printf("[D-TCP] phase=CALIBRATION state=starting strategy=%s min=%d max=%d growth=4x fine_resolution=%d up_down=sequential\n", strategy, opts.minSize, opts.maxSize, calibrationFineResolution)
 	}
 	profile := getPathProfile(s.serverAddr, s.token, opts)
-	fmt.Printf("[D-TCP] phase=CALIBRATION state=success upload=%d download=%d persistent=%t\n", profile.upload, profile.download, profile.persistent)
-	fmt.Printf("[D-TCP] phase=ACTIVE wire=%s header_mask=%02x clear_payload=%t upload_chunk=%d download_chunk=%d\n", choice.mode, choice.mask, choice.cover.Clear, profile.upload, profile.download)
+	safeChunk := minInt(profile.upload, profile.download)
+	fmt.Printf("[D-TCP] phase=WORKERS chunk=%d safe_kb=%d workers=%d target_aggregate_kb=1024 rule=auto_scale\n", safeChunk, safeChunk/1024, profile.pollers)
+	fmt.Printf("[D-TCP] phase=CALIBRATION state=success upload=%d download=%d pollers=%d persistent=%t\n", profile.upload, profile.download, profile.pollers, profile.persistent)
+	fmt.Printf("[D-TCP] phase=ACTIVE wire=%s header_mask=%02x clear_payload=%t upload_chunk=%d download_chunk=%d pollers=%d\n", choice.mode, choice.mask, choice.cover.Clear, profile.upload, profile.download, profile.pollers)
 	return choice, nil
 }
 

@@ -260,6 +260,15 @@ func handleMuxConnection(mc *muxServerConn, manager *streamManager) {
   mc.sendResponse(wire.StatusOK, req.RequestID, nil)
   ```
 
+### 6.6 Fake iPerf Sustentado e Conexões Paralelas (1 Mbps / até 64 Workers)
+* O cliente calibra o tamanho máximo de chunk seguro (`upload` e `download`) de forma ascendente.
+* Em seguida, se o teste sustentado estiver ativado (ex: `--iperf-duration 15s` ou via app Android):
+  - O cliente calcula o número de conexões/workers paralelos necessários para atingir **1024 KB** (1 Mbps de vazão agregada):
+    $$\text{workers} = \frac{1024 \times 1024}{\text{safeChunk}} \quad (\text{limitado entre } 1 \text{ e } 64)$$
+  - **Exemplo**: Se a operadora bloqueia pacotes grandes e limita o chunk seguro em 16 KB (16384 bytes), o cliente escala para **64 workers paralelos** ($64 \times 16\text{ KB} = 1024\text{ KB} = 1\text{ Mbps}$).
+  - Se o chunk for 32 KB, usa 32 workers; se for 64 KB, usa 16 workers; se for 1 MB, usa 1 worker.
+  - O servidor DragonTCP processa esses probes `ProbeIperfUpload` e `ProbeIperfDownload` respondendo `StatusOK` ou enviando os dados de teste solicitados sem enfileiramento pesado.
+
 ---
 
 ## 7. Checklist de Validação no Servidor
@@ -267,5 +276,6 @@ func handleMuxConnection(mc *muxServerConn, manager *streamManager) {
 - [ ] Sincronizar o pacote `internal/wire` com as constantes `MuxRequestHeaderSize (33)` e `MuxResponseHeaderSize (9)`.
 - [ ] Garantir que o `writeMu` proteja qualquer chamada a `WriteMuxResponse*` na conexão TCP física.
 - [ ] Garantir que **todas** as respostas a uma requisição (incluindo erros e frames de continuação de download) ecoem exatamente o mesmo `RequestID` recebido.
+- [ ] Garantir capacidade de absorver até 64 requisições simultâneas de calibração paralela durante o teste de Fake iPerf.
 - [ ] Verificar se clientes v1 continuam funcionando normalmente na mesma porta via roteamento dinâmico ou flags de capability.
 - [ ] Executar testes de estresse com múltiplas sessões SOCKS5 concorrentes para verificar ausência de travamentos ou concorrência na escrita de sockets.

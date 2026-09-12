@@ -516,3 +516,75 @@ func TestAdaptiveSizerLinearShrinkStep(t *testing.T) {
 		t.Fatalf("linear failure should reduce 824 -> 624, got %d", next)
 	}
 }
+
+func TestCalculateParallelWorkers(t *testing.T) {
+	tests := []struct {
+		chunkSize int
+		want      int
+	}{
+		{chunkSize: 16 * 1024, want: 64},
+		{chunkSize: 32 * 1024, want: 32},
+		{chunkSize: 64 * 1024, want: 16},
+		{chunkSize: 128 * 1024, want: 8},
+		{chunkSize: 256 * 1024, want: 4},
+		{chunkSize: 512 * 1024, want: 2},
+		{chunkSize: 1024 * 1024, want: 1},
+		{chunkSize: 0, want: 64},
+		{chunkSize: -100, want: 64},
+		{chunkSize: 8 * 1024, want: 64},        // capped at 64
+		{chunkSize: 2 * 1024 * 1024, want: 1}, // capped at 1
+	}
+
+	for _, tt := range tests {
+		got := calculateParallelWorkers(tt.chunkSize)
+		if got != tt.want {
+			t.Errorf("calculateParallelWorkers(%d) = %d, want %d", tt.chunkSize, got, tt.want)
+		}
+	}
+}
+
+func TestProbeIperfSustainedParallel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				for {
+					req, err := wire.ReadRequest(c)
+					if err != nil {
+						return
+					}
+					if err := wire.WriteResponse(c, wire.StatusOK, nil); err != nil {
+						return
+					}
+					_ = req
+				}
+			}(conn)
+		}
+	}()
+
+	opts := chunkClientOptions{
+		minSize:    32,
+		maxSize:    1024 * 1024,
+		txnTimeout: 500 * time.Millisecond,
+	}
+
+	// Run sustained probe for 100ms targeting 1.0 Mbps with 16KB chunk (64 workers)
+	res := probeIperfSustainedParallel(ln.Addr().String(), "", opts, wire.ProbeUpload, 16*1024, 100*time.Millisecond, 1.0)
+
+	if !res.ok {
+		t.Fatalf("expected sustained probe ok=true, got ok=false (bytes=%d, err=%v)", res.bytes, res.err)
+	}
+	if res.bytes <= 0 {
+		t.Fatalf("expected bytes > 0, got %d", res.bytes)
+	}
+}

@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"dragontcp/internal/protocol"
 )
 
 // sshCarrierConn absorbs the relatively small encrypted writes produced by the
@@ -37,6 +39,7 @@ func newSSHCarrierConn(raw net.Conn, flushBytes, maxBuffered int, flushDelay tim
 	if raw == nil {
 		return nil
 	}
+	protocol.TuneTCP(raw)
 	if flushBytes < 32*1024 {
 		flushBytes = 32 * 1024
 	}
@@ -209,3 +212,57 @@ func (c *sshCarrierConn) RemoteAddr() net.Addr               { return c.raw.Remo
 func (c *sshCarrierConn) SetDeadline(t time.Time) error      { return c.raw.SetDeadline(t) }
 func (c *sshCarrierConn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadline(t) }
 func (c *sshCarrierConn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
+
+func (c *sshCarrierConn) NetConn() net.Conn {
+	return c.raw
+}
+
+func (c *sshCarrierConn) SetNoDelay(noDelay bool) error {
+	if tcp, ok := c.raw.(*net.TCPConn); ok {
+		return tcp.SetNoDelay(noDelay)
+	}
+	if sc, ok := c.raw.(interface{ SetNoDelay(bool) error }); ok {
+		return sc.SetNoDelay(noDelay)
+	}
+	return nil
+}
+
+func (c *sshCarrierConn) SetReadBuffer(bytes int) error {
+	if tcp, ok := c.raw.(*net.TCPConn); ok {
+		return tcp.SetReadBuffer(bytes)
+	}
+	if sc, ok := c.raw.(interface{ SetReadBuffer(int) error }); ok {
+		return sc.SetReadBuffer(bytes)
+	}
+	return nil
+}
+
+func (c *sshCarrierConn) SetWriteBuffer(bytes int) error {
+	if tcp, ok := c.raw.(*net.TCPConn); ok {
+		return tcp.SetWriteBuffer(bytes)
+	}
+	if sc, ok := c.raw.(interface{ SetWriteBuffer(int) error }); ok {
+		return sc.SetWriteBuffer(bytes)
+	}
+	return nil
+}
+
+func (c *sshCarrierConn) SetKeepAlive(keepalive bool) error {
+	if tcp, ok := c.raw.(*net.TCPConn); ok {
+		return tcp.SetKeepAlive(keepalive)
+	}
+	if sc, ok := c.raw.(interface{ SetKeepAlive(bool) error }); ok {
+		return sc.SetKeepAlive(keepalive)
+	}
+	return nil
+}
+
+func (c *sshCarrierConn) SetKeepAlivePeriod(d time.Duration) error {
+	if tcp, ok := c.raw.(*net.TCPConn); ok {
+		return tcp.SetKeepAlivePeriod(d)
+	}
+	if sc, ok := c.raw.(interface{ SetKeepAlivePeriod(time.Duration) error }); ok {
+		return sc.SetKeepAlivePeriod(d)
+	}
+	return nil
+}
