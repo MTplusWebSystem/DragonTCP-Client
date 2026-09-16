@@ -67,6 +67,26 @@ type Options struct {
 	tcpBuffer         int
 	headerMask        byte
 	coverProfile      cover.Profile
+	iperfDuration     time.Duration
+	iperfTargetMbps   float64
+}
+
+// WithIperf configures sustained fake-iperf test parameters.
+func (o Options) WithIperf(duration time.Duration, targetMbps float64) Options {
+	o.iperfDuration = duration
+	o.iperfTargetMbps = targetMbps
+	return o
+}
+
+// WithPollers overrides the number of parallel workers/lanes.
+func (o Options) WithPollers(pollers int) Options {
+	o.pollers = pollers
+	return o
+}
+
+// Pollers returns the configured number of parallel workers.
+func (o Options) Pollers() int {
+	return o.pollers
 }
 
 // WithHeaderMask returns a copy using one fixed frame-magic profile. The mask
@@ -347,8 +367,7 @@ func (l *txnLane) ensureConn() error {
 	}
 
 	l.closeLocked()
-	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	conn, err := d.Dial("tcp", l.serverAddr)
+	conn, err := protocol.DialTCP("tcp", l.serverAddr, 10*time.Second, l.tcpBuffer)
 	if err != nil {
 		return err
 	}
@@ -356,8 +375,6 @@ func (l *txnLane) ensureConn() error {
 		_ = conn.Close()
 		return err
 	}
-	protocol.TuneTCP(conn)
-	protocol.TuneTCPBuffer(conn, l.tcpBuffer)
 	l.conn = conn
 	return nil
 }
@@ -703,6 +720,115 @@ func minDurationX(a, b time.Duration) time.Duration {
 	return b
 }
 
+// CalculateParallelWorkers calculates the number of parallel workers required
+// to reach 1024 KB (1 Mbps aggregate throughput). For example, 16 KB yields 64 workers.
+func CalculateParallelWorkers(chunkSize int) int {
+	if chunkSize <= 0 {
+		return 64
+	}
+	const targetBytes = 1024 * 1024
+	workers := targetBytes / chunkSize
+	if targetBytes%chunkSize != 0 {
+		workers++
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 64 {
+		workers = 64
+	}
+	return workers
+}
+
+func probeCalibrationSustainedParallel(serverAddr, token string, opts Options, download bool, safeChunk int, duration time.Duration, targetMbps float64) calibrationProbeResult {
+	if duration <= 0 {
+		duration = 15 * time.Second
+	}
+	if targetMbps <= 0 {
+		targetMbps = 1.0
+	}
+	if safeChunk <= 0 {
+		safeChunk = opts.minSize
+	}
+	if safeChunk < 32 {
+		safeChunk = 32
+	}
+
+	workers := CalculateParallelWorkers(safeChunk)
+	name := "upload"
+	if download {
+		name = "download"
+	}
+
+	fmt.Printf("[D-TCP] phase=CALIBRATION fake_iperf=%s wire=x stage=sustained duration=%.1fs workers=%d chunk=%d target_mbps=%.2f\n",
+		name, duration.Seconds(), workers, safeChunk, targetMbps)
+
+	started := time.Now()
+	deadline := started.Add(duration)
+
+	var totalBytes atomic.Int64
+	var activeErrors atomic.Int64
+	var wg sync.WaitGroup
+
+	stopCh := make(chan struct{})
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	go func() {
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				elapsed := time.Since(started).Seconds()
+				if elapsed > 0 {
+					bytes := totalBytes.Load()
+					currentMbps := (float64(bytes*8) / 1_000_000) / elapsed
+					fmt.Printf("[D-TCP] phase=CALIBRATION fake_iperf=%s wire=x stage=streaming elapsed=%.1fs/%.1fs workers=%d bytes=%.2fMB current_mbps=%.2f target_mbps=%.2f\n",
+						name, elapsed, duration.Seconds(), workers, float64(bytes)/1024/1024, currentMbps, targetMbps)
+				}
+			}
+		}
+	}()
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				res := probeCalibrationSize(serverAddr, token, opts, download, safeChunk)
+				if !res.ok {
+					activeErrors.Add(1)
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+				totalBytes.Add(int64(res.bytes))
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(stopCh)
+
+	elapsed := time.Since(started)
+	bytes := totalBytes.Load()
+	finalMbps := float64(0)
+	if elapsed.Seconds() > 0 {
+		finalMbps = (float64(bytes*8) / 1_000_000) / elapsed.Seconds()
+	}
+
+	targetReached := finalMbps >= targetMbps
+	fmt.Printf("[D-TCP] phase=CALIBRATION fake_iperf=%s wire=x stage=summary duration=%.1fs workers=%d chunk=%d total_bytes=%.2fMB final_mbps=%.2f target_reached=%t\n",
+		name, elapsed.Seconds(), workers, safeChunk, float64(bytes)/1024/1024, finalMbps, targetReached)
+
+	return calibrationProbeResult{
+		ok:      targetReached || bytes > 0,
+		bytes:   int(bytes),
+		elapsed: elapsed,
+		err:     nil,
+	}
+}
+
 // Calibrate performs the X wire's pre-tunnel UP/DW fake-iperf calibration.
 // It ascends by 4x and only spends extra probes around the first failure, where
 // it resolves the highest stable boundary to the requested byte precision.
@@ -719,6 +845,15 @@ func Calibrate(serverAddr, token string, opts Options, fine int) (upload, downlo
 	upload = calibrateMaximum(serverAddr, token, opts, false, fine)
 	download = calibrateMaximum(serverAddr, token, opts, true, fine)
 	persistent = probePersistent(serverAddr, token, opts)
+
+	if opts.iperfDuration > 0 {
+		targetMbps := opts.iperfTargetMbps
+		if targetMbps <= 0 {
+			targetMbps = 1.0
+		}
+		probeCalibrationSustainedParallel(serverAddr, token, opts, false, upload, opts.iperfDuration, targetMbps)
+		probeCalibrationSustainedParallel(serverAddr, token, opts, true, download, opts.iperfDuration, targetMbps)
+	}
 	return
 }
 

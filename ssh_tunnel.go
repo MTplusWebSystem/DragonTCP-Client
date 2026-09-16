@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"dragontcp/internal/protocol"
 )
 
 type sshTunnelManager struct {
@@ -22,6 +24,7 @@ type sshTunnelManager struct {
 	pinFile      string
 	udpgwHost    string
 	udpgwPort    int
+	tcpBuffer    int
 
 	mu     sync.Mutex
 	client *ssh.Client
@@ -31,7 +34,7 @@ type sshTunnelManager struct {
 	udpLogged      atomic.Bool
 }
 
-func newSSHTunnelManager(wires *wireSelector, username, password, internalHost string, internalPort int, pinFile, udpgwHost string, udpgwPort int) (*sshTunnelManager, error) {
+func newSSHTunnelManager(wires *wireSelector, username, password, internalHost string, internalPort int, pinFile, udpgwHost string, udpgwPort int, tcpBuffer int) (*sshTunnelManager, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return nil, errors.New("SSH username is required")
@@ -55,6 +58,7 @@ func newSSHTunnelManager(wires *wireSelector, username, password, internalHost s
 		wires: wires, username: username, password: password,
 		internalHost: internalHost, internalPort: internalPort,
 		pinFile: pinFile, udpgwHost: udpgwHost, udpgwPort: udpgwPort,
+		tcpBuffer: tcpBuffer,
 	}, nil
 }
 
@@ -99,16 +103,33 @@ func (m *sshTunnelManager) connectLocked() (*ssh.Client, error) {
 	}
 
 	fmt.Printf("ssh carrier: opening DragonTCP stream to %s:%d\n", m.internalHost, m.internalPort)
-	transport, err := m.wires.dial(m.internalHost, m.internalPort)
+	var transport net.Conn
+	var err error
+	if m.wires != nil {
+		transport, err = m.wires.dial(m.internalHost, m.internalPort)
+	} else {
+		transport, err = protocol.DialTCP("tcp", net.JoinHostPort(m.internalHost, fmt.Sprintf("%d", m.internalPort)), 10*time.Second, m.tcpBuffer)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("DragonTCP SSH carrier failed: %w", err)
+	}
+	protocol.TuneTCP(transport)
+	protocol.TuneTCPBuffer(transport, m.tcpBuffer)
+
+	writeBatch := sshCarrierWriteBatch
+	maxBuffered := sshCarrierMaxBuffered
+	if m.tcpBuffer > maxBuffered {
+		maxBuffered = m.tcpBuffer
 	}
 	// SSH emits encrypted packets in ~tens-of-KiB writes. Feeding each one
 	// directly into the transactional DragonTCP transport creates a full RTT per
 	// SSH packet. Combine them behind bounded backpressure so a busy SSH stream
 	// reaches DragonTCP's discovered 256 KiB-1 MiB chunk sizes instead.
-	transport = newSSHCarrierConn(transport, sshCarrierWriteBatch, sshCarrierMaxBuffered, sshCarrierFlushDelay)
-	fmt.Printf("ssh carrier: DragonTCP stream connected write_batch=%d max_buffer=%d flush_delay=%s\n", sshCarrierWriteBatch, sshCarrierMaxBuffered, sshCarrierFlushDelay)
+	transport = newSSHCarrierConn(transport, writeBatch, maxBuffered, sshCarrierFlushDelay)
+	protocol.TuneTCP(transport)
+	protocol.TuneTCPBuffer(transport, m.tcpBuffer)
+
+	fmt.Printf("ssh carrier: DragonTCP stream connected write_batch=%d max_buffer=%d flush_delay=%s tcp_nodelay=true tcp_buffer=%d\n", writeBatch, maxBuffered, sshCarrierFlushDelay, m.tcpBuffer)
 	cfg := &ssh.ClientConfig{
 		User:            m.username,
 		Auth:            []ssh.AuthMethod{ssh.Password(m.password)},
@@ -182,6 +203,8 @@ func (m *sshTunnelManager) DialTCP(host string, port int) (net.Conn, error) {
 			if m.firstTCPLogged.CompareAndSwap(false, true) {
 				fmt.Printf("ssh traffic: direct-tcpip active\n")
 			}
+			protocol.TuneTCP(conn)
+			protocol.TuneTCPBuffer(conn, m.tcpBuffer)
 			return conn, nil
 		}
 		lastErr = err
@@ -203,8 +226,12 @@ func (m *sshTunnelManager) DialTCP(host string, port int) (net.Conn, error) {
 
 func (m *sshTunnelManager) DialUDPGW() (net.Conn, error) {
 	conn, err := m.DialTCP(m.udpgwHost, m.udpgwPort)
-	if err == nil && m.udpLogged.CompareAndSwap(false, true) {
-		fmt.Printf("ssh traffic: UDPGW active target=%s:%d\n", m.udpgwHost, m.udpgwPort)
+	if err == nil {
+		protocol.TuneTCP(conn)
+		protocol.TuneTCPBuffer(conn, m.tcpBuffer)
+		if m.udpLogged.CompareAndSwap(false, true) {
+			fmt.Printf("ssh traffic: UDPGW active target=%s:%d\n", m.udpgwHost, m.udpgwPort)
+		}
 	}
 	return conn, err
 }

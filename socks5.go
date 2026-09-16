@@ -71,6 +71,8 @@ func handleSOCKS5(conn net.Conn, manager *sshTunnelManager) error {
 			return err
 		}
 		defer remote.Close()
+		protocol.TuneTCP(remote)
+		protocol.TuneTCPBuffer(remote, manager.tcpBuffer)
 		if err := socksReply(conn, 0, remote.LocalAddr()); err != nil {
 			return err
 		}
@@ -185,6 +187,9 @@ func socksReply(w io.Writer, rep byte, addr net.Addr) error {
 		}
 		port = udpAddr.Port
 	}
+	if port == 0 {
+		port = 1080
+	}
 	out := []byte{5, rep, 0, socksAtypIPv4, 0, 0, 0, 0, 0, 0}
 	copy(out[4:8], ip.To4())
 	binary.BigEndian.PutUint16(out[8:10], uint16(port))
@@ -198,6 +203,10 @@ func handleSOCKSUDPAssociate(control net.Conn, br *bufio.Reader, manager *sshTun
 		return err
 	}
 	defer udp.Close()
+	if manager.tcpBuffer > 0 {
+		_ = udp.SetReadBuffer(manager.tcpBuffer)
+		_ = udp.SetWriteBuffer(manager.tcpBuffer)
+	}
 	if err := socksReply(control, 0, udp.LocalAddr()); err != nil {
 		return err
 	}
@@ -207,6 +216,8 @@ func handleSOCKSUDPAssociate(control net.Conn, br *bufio.Reader, manager *sshTun
 		return err
 	}
 	defer gw.Close()
+	protocol.TuneTCP(gw)
+	protocol.TuneTCPBuffer(gw, manager.tcpBuffer)
 	_ = gw.SetDeadline(time.Time{})
 
 	done := make(chan struct{})

@@ -234,3 +234,29 @@ func TestWithCalibratedChunksLocksIndependentXSizes(t *testing.T) {
 		t.Fatalf("download calibrated chunk changed to %d", down.Current())
 	}
 }
+
+func TestCalculateParallelWorkers(t *testing.T) {
+	tests := []struct {
+		chunkSize int
+		want      int
+	}{
+		{chunkSize: 16 * 1024, want: 64},
+		{chunkSize: 32 * 1024, want: 32},
+		{chunkSize: 64 * 1024, want: 16},
+		{chunkSize: 128 * 1024, want: 8},
+		{chunkSize: 256 * 1024, want: 4},
+		{chunkSize: 512 * 1024, want: 2},
+		{chunkSize: 1024 * 1024, want: 1},
+		{chunkSize: 0, want: 64},
+		{chunkSize: -50, want: 64},
+		{chunkSize: 8 * 1024, want: 64},        // capped at 64
+		{chunkSize: 2 * 1024 * 1024, want: 1}, // capped at 1
+	}
+
+	for _, tt := range tests {
+		got := CalculateParallelWorkers(tt.chunkSize)
+		if got != tt.want {
+			t.Errorf("CalculateParallelWorkers(%d) = %d, want %d", tt.chunkSize, got, tt.want)
+		}
+	}
+}

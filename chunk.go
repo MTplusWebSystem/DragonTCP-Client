@@ -37,6 +37,8 @@ type chunkClientOptions struct {
 	coverProfile   cover.Profile
 	skipPathProbe  bool
 	forceMaxStart  bool
+	iperfDuration  time.Duration
+	iperfTargetMbps float64
 }
 
 type adaptiveSizer struct {
@@ -266,8 +268,7 @@ func (l *requestLane) ensureLocked() error {
 		}
 		l.discardLocked()
 	}
-	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	conn, err := d.Dial("tcp", l.serverAddr)
+	conn, err := protocol.DialTCP("tcp", l.serverAddr, 10*time.Second, l.tcpBuffer)
 	if err != nil {
 		return err
 	}
@@ -275,8 +276,6 @@ func (l *requestLane) ensureLocked() error {
 		_ = conn.Close()
 		return err
 	}
-	protocol.TuneTCP(conn)
-	protocol.TuneTCPBuffer(conn, l.tcpBuffer)
 	l.pc = &physicalConn{conn: conn}
 	return nil
 }
@@ -421,6 +420,7 @@ func (l *requestLane) download(sid wire.SessionID, startOffset, ackOffset uint64
 type pathProfile struct {
 	upload     int
 	download   int
+	pollers    int
 	persistent bool
 	at         time.Time
 }
@@ -531,8 +531,7 @@ func calibrationDeadline(opts chunkClientOptions) time.Duration {
 }
 
 func dialProbeConn(serverAddr string, opts chunkClientOptions) (net.Conn, error) {
-	d := net.Dialer{Timeout: minDuration(calibrationDeadline(opts), 10*time.Second), KeepAlive: 30 * time.Second}
-	conn, err := d.Dial("tcp", serverAddr)
+	conn, err := protocol.DialTCP("tcp", serverAddr, minDuration(calibrationDeadline(opts), 10*time.Second), opts.tcpBuffer)
 	if err != nil {
 		return nil, err
 	}
@@ -540,8 +539,6 @@ func dialProbeConn(serverAddr string, opts chunkClientOptions) (net.Conn, error)
 		_ = conn.Close()
 		return nil, err
 	}
-	protocol.TuneTCP(conn)
-	protocol.TuneTCPBuffer(conn, opts.tcpBuffer)
 	_ = conn.SetDeadline(time.Now().Add(calibrationDeadline(opts)))
 	return conn, nil
 }
@@ -612,6 +609,119 @@ func probeIperfOne(serverAddr, token string, opts chunkClientOptions, kind byte,
 		return iperfProbeResult{ok: true, bytes: gotBytes, elapsed: time.Since(started)}
 	default:
 		return iperfProbeResult{err: fmt.Errorf("unknown iperf probe kind %d", kind)}
+	}
+}
+
+// calculateParallelWorkers calculates how many concurrent connections/workers are required
+// to reach 1024 KB (1 Mbps aggregate throughput) when the individual chunk size is constrained.
+// For example, if a carrier caps chunk size to 16 KB (16384 bytes), 64 parallel workers are used
+// (64 * 16 KB = 1024 KB).
+func calculateParallelWorkers(chunkSize int) int {
+	if chunkSize <= 0 {
+		return 64
+	}
+	const targetBytes = 1024 * 1024
+	workers := targetBytes / chunkSize
+	if targetBytes%chunkSize != 0 {
+		workers++
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 64 {
+		workers = 64
+	}
+	return workers
+}
+
+// probeIperfSustainedParallel runs a sustained multi-worker Fake iPerf test for the specified
+// duration (e.g. 15s) targeting aggregate throughput of targetMbps (e.g. 1.0 Mbps).
+// If the safe chunk is smaller than 1024 KB (e.g. 16 KB), it spawns up to 64 parallel workers
+// to reach 1024 KB aggregate throughput.
+func probeIperfSustainedParallel(serverAddr, token string, opts chunkClientOptions, kind byte, safeChunk int, duration time.Duration, targetMbps float64) iperfProbeResult {
+	if duration <= 0 {
+		duration = 15 * time.Second
+	}
+	if targetMbps <= 0 {
+		targetMbps = 1.0
+	}
+	if safeChunk <= 0 {
+		safeChunk = opts.minSize
+	}
+	if safeChunk < 32 {
+		safeChunk = 32
+	}
+
+	workers := calculateParallelWorkers(safeChunk)
+	name := probeKindName(kind)
+
+	fmt.Printf("[D-TCP] phase=CALIBRATION fake_iperf=%s stage=sustained duration=%.1fs workers=%d chunk=%d target_mbps=%.2f\n",
+		name, duration.Seconds(), workers, safeChunk, targetMbps)
+
+	started := time.Now()
+	deadline := started.Add(duration)
+
+	var totalBytes atomic.Int64
+	var activeErrors atomic.Int64
+	var wg sync.WaitGroup
+
+	stopCh := make(chan struct{})
+
+	// Progress ticker reporting aggregate speed every second
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	go func() {
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				elapsed := time.Since(started).Seconds()
+				if elapsed > 0 {
+					bytes := totalBytes.Load()
+					currentMbps := (float64(bytes) * 8 / 1_000_000) / elapsed
+					fmt.Printf("[D-TCP] phase=CALIBRATION fake_iperf=%s stage=streaming elapsed=%.1fs/%.1fs workers=%d bytes=%.2fMB current_mbps=%.2f target_mbps=%.2f\n",
+						name, elapsed, duration.Seconds(), workers, float64(bytes)/1024/1024, currentMbps, targetMbps)
+				}
+			}
+		}
+	}()
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				res := probeIperfOne(serverAddr, token, opts, kind, safeChunk)
+				if !res.ok {
+					activeErrors.Add(1)
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+				totalBytes.Add(int64(res.bytes))
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(stopCh)
+
+	elapsed := time.Since(started)
+	bytes := totalBytes.Load()
+	finalMbps := float64(0)
+	if elapsed.Seconds() > 0 {
+		finalMbps = (float64(bytes) * 8 / 1_000_000) / elapsed.Seconds()
+	}
+
+	targetReached := finalMbps >= targetMbps
+	fmt.Printf("[D-TCP] phase=CALIBRATION fake_iperf=%s stage=summary duration=%.1fs workers=%d chunk=%d total_bytes=%.2fMB final_mbps=%.2f target_reached=%t\n",
+		name, elapsed.Seconds(), workers, safeChunk, float64(bytes)/1024/1024, finalMbps, targetReached)
+
+	return iperfProbeResult{
+		ok:      targetReached || bytes > 0,
+		bytes:   int(bytes),
+		elapsed: elapsed,
+		err:     nil,
 	}
 }
 
@@ -951,13 +1061,25 @@ func getPathProfile(serverAddr, token string, opts chunkClientOptions) pathProfi
 		p.download = probeMaximum(serverAddr, token, opts, wire.ProbeDownload)
 	}
 	p.persistent = probePersistent(serverAddr, token, opts)
+	safeChunk := minInt(p.upload, p.download)
+	p.pollers = calculateParallelWorkers(safeChunk)
+	fmt.Printf("[D-TCP] phase=WORKERS chunk=%d safe_kb=%d workers=%d target_aggregate_kb=1024 rule=auto_scale\n", safeChunk, safeChunk/1024, p.pollers)
 
-	fmt.Printf("path probe: strategy=%s upload=%d download=%d persistent=%t\n", func() string {
+	if opts.iperfDuration > 0 {
+		targetMbps := opts.iperfTargetMbps
+		if targetMbps <= 0 {
+			targetMbps = 1.0
+		}
+		probeIperfSustainedParallel(serverAddr, token, opts, wire.ProbeUpload, p.upload, opts.iperfDuration, targetMbps)
+		probeIperfSustainedParallel(serverAddr, token, opts, wire.ProbeDownload, p.download, opts.iperfDuration, targetMbps)
+	}
+
+	fmt.Printf("path probe: strategy=%s upload=%d download=%d pollers=%d persistent=%t\n", func() string {
 		if opts.forceMaxStart {
 			return "max-first"
 		}
 		return "ascending"
-	}(), p.upload, p.download, p.persistent)
+	}(), p.upload, p.download, p.pollers, p.persistent)
 
 	profileState.Lock()
 	profileState.key = key
@@ -1079,6 +1201,9 @@ func openChunkTunnel(serverAddr, token, targetHost string, targetPort int, opts 
 	}
 	if !opts.skipPathProbe {
 		profile = getPathProfile(serverAddr, token, opts)
+		if profile.pollers > opts.pollers {
+			opts.pollers = profile.pollers
+		}
 	}
 	reconnect := opts.reconnectEvery
 	// Compatibility-friendly reconnect modes:

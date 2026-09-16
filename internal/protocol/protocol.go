@@ -1,11 +1,14 @@
 package protocol
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -215,11 +218,45 @@ func RelayRaw(a, b net.Conn) {
 	})
 }
 
+func extractTCPConn(conn net.Conn) *net.TCPConn {
+	for conn != nil {
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			return tcp
+		}
+		switch c := conn.(type) {
+		case *BufferedConn:
+			conn = c.Conn
+		case interface{ NetConn() net.Conn }:
+			conn = c.NetConn()
+		case interface{ Underlying() net.Conn }:
+			conn = c.Underlying()
+		case interface{ RawConn() net.Conn }:
+			conn = c.RawConn()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func TuneTCP(conn net.Conn) {
-	if tcp, ok := conn.(*net.TCPConn); ok {
+	if conn == nil {
+		return
+	}
+	if tcp := extractTCPConn(conn); tcp != nil {
 		_ = tcp.SetNoDelay(true)
 		_ = tcp.SetKeepAlive(true)
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		return
+	}
+	if sc, ok := conn.(interface{ SetNoDelay(bool) error }); ok {
+		_ = sc.SetNoDelay(true)
+	}
+	if sc, ok := conn.(interface{ SetKeepAlive(bool) error }); ok {
+		_ = sc.SetKeepAlive(true)
+	}
+	if sc, ok := conn.(interface{ SetKeepAlivePeriod(time.Duration) error }); ok {
+		_ = sc.SetKeepAlivePeriod(30 * time.Second)
 	}
 }
 
@@ -228,11 +265,144 @@ func TuneTCP(conn net.Conn) {
 // for large connection counts. For a small number of high-BDP mobile links,
 // values such as 1048576 or 4194304 can improve throughput.
 func TuneTCPBuffer(conn net.Conn, size int) {
-	if size <= 0 {
+	if conn == nil || size <= 0 {
 		return
 	}
-	if tcp, ok := conn.(*net.TCPConn); ok {
+	if tcp := extractTCPConn(conn); tcp != nil {
 		_ = tcp.SetReadBuffer(size)
 		_ = tcp.SetWriteBuffer(size)
+		return
+	}
+	if sc, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
+		_ = sc.SetReadBuffer(size)
+	}
+	if sc, ok := conn.(interface{ SetWriteBuffer(int) error }); ok {
+		_ = sc.SetWriteBuffer(size)
 	}
 }
+
+var (
+	globalPayloadMu sync.RWMutex
+	globalPayload   string
+)
+
+func SetGlobalPayload(payload string) {
+	globalPayloadMu.Lock()
+	globalPayload = payload
+	globalPayloadMu.Unlock()
+}
+
+func GetGlobalPayload() string {
+	globalPayloadMu.RLock()
+	defer globalPayloadMu.RUnlock()
+	return globalPayload
+}
+
+type BufferedConn struct {
+	net.Conn
+	R io.Reader
+}
+
+func (b *BufferedConn) Read(p []byte) (int, error) {
+	return b.R.Read(p)
+}
+
+func FormatPayload(template, host, port string) string {
+	if strings.TrimSpace(template) == "" {
+		return ""
+	}
+	hostPort := net.JoinHostPort(host, port)
+	r := strings.NewReplacer(
+		"[crlf]", "\r\n",
+		"[CRLF]", "\r\n",
+		"[lf]", "\n",
+		"[LF]", "\n",
+		"[cr]", "\r",
+		"[CR]", "\r",
+		"[host_port]", hostPort,
+		"[HOST_PORT]", hostPort,
+		"[host]", host,
+		"[HOST]", host,
+		"[port]", port,
+		"[PORT]", port,
+		"[protocol]", "HTTP/1.1",
+		"[PROTOCOL]", "HTTP/1.1",
+		"[ua]", "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+		"[UA]", "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+	)
+	res := r.Replace(template)
+	trimmed := strings.TrimSpace(res)
+	if strings.HasPrefix(trimmed, "GET") || strings.HasPrefix(trimmed, "POST") || strings.HasPrefix(trimmed, "CONNECT") || strings.HasPrefix(trimmed, "HEAD") || strings.HasPrefix(trimmed, "PUT") {
+		if !strings.HasSuffix(res, "\r\n\r\n") {
+			if strings.HasSuffix(res, "\r\n") {
+				res += "\r\n"
+			} else {
+				res += "\r\n\r\n"
+			}
+		}
+	}
+	return res
+}
+
+func DialTCP(network, addr string, timeout time.Duration, tcpBuffer int) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	conn, err := d.Dial(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	TuneTCP(conn)
+	TuneTCPBuffer(conn, tcpBuffer)
+
+	payload := GetGlobalPayload()
+	if strings.TrimSpace(payload) == "" {
+		return conn, nil
+	}
+
+	host, port, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		host = addr
+		port = "80"
+	}
+	formatted := FormatPayload(payload, host, port)
+	if formatted == "" {
+		return conn, nil
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write([]byte(formatted)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("payload write failed: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("payload read response failed: %w", err)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("payload header read failed: %w", err)
+		}
+		if line == "\r\n" || line == "\n" || strings.TrimRight(line, "\r\n") == "" {
+			break
+		}
+	}
+	_ = conn.SetDeadline(time.Time{})
+
+	trimmedStatus := strings.TrimSpace(statusLine)
+	parts := strings.SplitN(trimmedStatus, " ", 3)
+	if len(parts) >= 2 {
+		statusCode, _ := strconv.Atoi(parts[1])
+		if statusCode >= 400 {
+			_ = conn.Close()
+			return nil, fmt.Errorf("payload rejected: %s", trimmedStatus)
+		}
+	}
+	fmt.Printf("[D-TCP] phase=PAYLOAD state=success status=%q\n", trimmedStatus)
+
+	return &BufferedConn{Conn: conn, R: br}, nil
+}
+

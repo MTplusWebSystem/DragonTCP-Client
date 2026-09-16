@@ -95,8 +95,7 @@ func (l *bpLane) ensureLocked() error {
 		}
 		l.discardLocked()
 	}
-	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	conn, err := d.Dial("tcp", l.serverAddr)
+	conn, err := protocol.DialTCP("tcp", l.serverAddr, 10*time.Second, l.tcpBuffer)
 	if err != nil {
 		return err
 	}
@@ -104,8 +103,6 @@ func (l *bpLane) ensureLocked() error {
 		_ = conn.Close()
 		return err
 	}
-	protocol.TuneTCP(conn)
-	protocol.TuneTCPBuffer(conn, l.tcpBuffer)
 	l.pc = &bpPhysicalConn{conn: conn}
 	return nil
 }
@@ -396,6 +393,9 @@ func openBPTunnel(serverAddr, token, targetHost string, targetPort int, opts chu
 		// transport. Reuse the authenticated DTP2 probe machinery to calibrate
 		// the carrier before BP starts moving SSH/application data.
 		profile = getPathProfile(serverAddr, token, opts)
+		if profile.pollers > opts.pollers {
+			opts.pollers = profile.pollers
+		}
 	}
 
 	sid, err := randomSessionID()

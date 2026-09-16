@@ -48,3 +48,13 @@ func TestServerResponseUsesConnectionProfile(t *testing.T) {
 		t.Fatalf("first byte=%02x, want %02x", got, byte('O')^profiled.mask)
 	}
 }
+
+func TestFormatPayload(t *testing.T) {
+	tmpl := "GET / HTTP/1.1[crlf]Host: [host]:[port][crlf]Upgrade: websocket[crlf][crlf]"
+	formatted := FormatPayload(tmpl, "1.2.3.4", "80")
+	expected := "GET / HTTP/1.1\r\nHost: 1.2.3.4:80\r\nUpgrade: websocket\r\n\r\n"
+	if formatted != expected {
+		t.Fatalf("got %q, want %q", formatted, expected)
+	}
+}
+
